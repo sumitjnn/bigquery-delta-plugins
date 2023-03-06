@@ -18,6 +18,7 @@ package io.cdap.delta.bigquery;
 
 import avro.shaded.com.google.common.collect.ImmutableList;
 import com.google.cloud.bigquery.BigQuery;
+import com.google.cloud.bigquery.BigQueryError;
 import com.google.cloud.bigquery.BigQueryException;
 import com.google.cloud.bigquery.Clustering;
 import com.google.cloud.bigquery.DatasetId;
@@ -29,6 +30,7 @@ import com.google.cloud.bigquery.FormatOptions;
 import com.google.cloud.bigquery.Job;
 import com.google.cloud.bigquery.JobId;
 import com.google.cloud.bigquery.JobInfo;
+import com.google.cloud.bigquery.JobStatus;
 import com.google.cloud.bigquery.LoadJobConfiguration;
 import com.google.cloud.bigquery.QueryJobConfiguration;
 import com.google.cloud.bigquery.StandardTableDefinition;
@@ -58,6 +60,7 @@ import net.jodah.failsafe.Failsafe;
 import net.jodah.failsafe.FailsafeException;
 import net.jodah.failsafe.RetryPolicy;
 import net.jodah.failsafe.TimeoutExceededException;
+import net.jodah.failsafe.event.ExecutionAttemptedEvent;
 import net.jodah.failsafe.function.ContextualRunnable;
 import org.apache.twill.common.Threads;
 import org.slf4j.Logger;
@@ -67,11 +70,14 @@ import java.io.IOException;
 import java.time.Duration;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -87,76 +93,75 @@ import javax.annotation.Nullable;
 
 /**
  * Consumes change events and applies them to BigQuery.
- *
+ * <p>
  * Writes to BigQuery in three steps.
- *
+ * <p>
  * Step 1 - Write a batch of changes to GCS
- *
+ * <p>
  * Each batch of changes is written to GCS as an object with path:
- *
- *   [staging bucket]/cdap/cdc/[app name]/[table id]/[batch id]
- *
+ * <p>
+ * [staging bucket]/cdap/cdc/[app name]/[table id]/[batch id]
+ * <p>
  * Batch id is the timestamp that the first event in the batch was processed.
  * The size of the batch is determined through configuration.
  * There is a maximum number of rows to include in each batch and a maximum amount of time to wait in between batches.
  * Each object is written in avro format and contains the columns in the destination table plus two additional columns:
- *   _op: CREATE | UPDATE | DELETE
- *   _batch_id: the batch id
- *
+ * _op: CREATE | UPDATE | DELETE
+ * _batch_id: the batch id
+ * <p>
  * Changes in the batch do not span across a DDL event, so they are guaranteed to conform to the same schema.
  * Failure scenarios are:
- *
- *   1. The program dies after the object is written, but before the offset is persisted.
- *      When the program starts up again, events for the batch will be replayed.
- *      The consumer will not know which events are duplicates, so duplicate events will be written out to GCS.
- *      This will not matter because of the behavior of later steps.
- *   2. The program dies before the object is written, which is always before the offset is persisted.
- *      In this case, nothing was ever persisted to GCS and everything behaves as if it was the first time
- *      the events were seen.
- *   3. The write to GCS fails for some reason. For example, permissions were revoked, quota was hit,
- *      there was a temporary outage, etc. In this scenario, the write will be repeatedly retried until it
- *      succeeds. It may need manual intervention to succeed.
- *
+ * <p>
+ * 1. The program dies after the object is written, but before the offset is persisted.
+ * When the program starts up again, events for the batch will be replayed.
+ * The consumer will not know which events are duplicates, so duplicate events will be written out to GCS.
+ * This will not matter because of the behavior of later steps.
+ * 2. The program dies before the object is written, which is always before the offset is persisted.
+ * In this case, nothing was ever persisted to GCS and everything behaves as if it was the first time
+ * the events were seen.
+ * 3. The write to GCS fails for some reason. For example, permissions were revoked, quota was hit,
+ * there was a temporary outage, etc. In this scenario, the write will be repeatedly retried until it
+ * succeeds. It may need manual intervention to succeed.
+ * <p>
  * Step 2 - Load data from GCS into staging BigQuery table
- *
+ * <p>
  * This step happens after the offset from Step 1 is successfully persisted. This will load the object
  * into a staging table in BigQuery. The staging table has the same schema as the rows in the GCS object.
  * It is clustered on _batch_id in order to make reads and deletes on the _batch_id efficient.
  * The job id for the load is of the form [app name]_stage_[dataset]_[table]_[batch id]_[retry num].
  * Failure scenarios are:
- *
- *   1. The load job fails for some reason. For example, permissions were revoked, quota was hit, temporary outage, etc.
- *      The load will be repeatedly retried until is succeeds. It may need manual intervention to succeed.
- *   2. The program dies. When the program starts up again, events will be replayed from the last committed offset.
- *
+ * <p>
+ * 1. The load job fails for some reason. For example, permissions were revoked, quota was hit, temporary outage, etc.
+ * The load will be repeatedly retried until is succeeds. It may need manual intervention to succeed.
+ * 2. The program dies. When the program starts up again, events will be replayed from the last committed offset.
+ * <p>
  * Step 3 - Merge a batch of data from the staging BigQuery table into the target table
- *
+ * <p>
  * This step happens after the load job to the staging table has succeeded. The consumer runs a merge query of the form:
- *
- *   MERGE [dataset].[target table] as T
- *   USING (SELECT * FROM [dataset].[staging table] WHERE _batch_id = [batch id]) as S
- *     ON [row equality condition]
- *   WHEN MATCHED AND S._OP = "DELETE"
- *     DELETE
- *   WHEN MATCHED AND S._OP = "UPDATE"
- *     UPDATE(...)
- *   WHEN NOT MATCHED AND S._OP = "INSERT"
- *     INSERT(...)
- *     VALUES(...)
- *
+ * <p>
+ * MERGE [dataset].[target table] as T
+ * USING (SELECT * FROM [dataset].[staging table] WHERE _batch_id = [batch id]) as S
+ * ON [row equality condition]
+ * WHEN MATCHED AND S._OP = "DELETE"
+ * DELETE
+ * WHEN MATCHED AND S._OP = "UPDATE"
+ * UPDATE(...)
+ * WHEN NOT MATCHED AND S._OP = "INSERT"
+ * INSERT(...)
+ * VALUES(...)
+ * <p>
  * The job id is of the form [app name]_merge_[dataset]_[table]_[batch id]_[retry_num].
  * This query ensures that it does not matter if there are duplicate events in the batch objects on GCS.
  * Duplicate inserts and deletes will not match and be ignored.
  * Duplicate updates will update the target row to be the same that it already is.
  * Once the job succeeds, the corresponding GCS object is deleted and the offset of the latest event is committed.
  * Failure scenarios are:
- *
- *   1. The merge query fails for some reason. The consumer will retry until it succeeds.
- *      It may need manual intervention to succeed.
- *   2. The program dies. Events are replayed from the last committed offset when the program starts back up.
- *   3. The GCS delete fails. The error is logged, but the consumer proceeds on.
- *      Manual deletion of the object is required.
- *
+ * <p>
+ * 1. The merge query fails for some reason. The consumer will retry until it succeeds.
+ * It may need manual intervention to succeed.
+ * 2. The program dies. Events are replayed from the last committed offset when the program starts back up.
+ * 3. The GCS delete fails. The error is logged, but the consumer proceeds on.
+ * Manual deletion of the object is required.
  */
 public class BigQueryEventConsumer implements EventConsumer {
   private static final Logger LOG = LoggerFactory.getLogger(BigQueryEventConsumer.class);
@@ -192,6 +197,12 @@ public class BigQueryEventConsumer implements EventConsumer {
   private long latestSequenceNum;
   private Exception flushException;
   private final AtomicBoolean shouldStop;
+  private RetryPolicy<Object> gcsWriterRetryPolicy = new RetryPolicy<>()
+                                                .withMaxAttempts(25)
+                                                .withMaxDuration(Duration.of(2, ChronoUnit.MINUTES))
+                                                .withBackoff(1, 30, ChronoUnit.SECONDS)
+                                                .withJitter(0.1);
+
   // have to keep all the records in memory in case there is a failure writing to GCS
   // cannot write to a temporary file on local disk either in case there is a failure writing to disk
   // Without keeping the entire batch in memory, there would be no way to recover the records that failed to write
@@ -223,6 +234,11 @@ public class BigQueryEventConsumer implements EventConsumer {
         if (failureContext.getAttemptCount() == 1 || !failureContext.getElapsedTime().minusMinutes(1).isNegative()) {
           LOG.warn("Error committing offset. Changes will be blocked until this succeeds.",
                    failureContext.getLastFailure());
+        }
+      })
+      .onSuccess(successContext -> {
+        if (successContext.getAttemptCount() > 1) {
+          LOG.info("Commited offset successfully after {} retries", (successContext.getAttemptCount() - 1));
         }
       });
     this.requireManualDrops = requireManualDrops;
@@ -283,22 +299,33 @@ public class BigQueryEventConsumer implements EventConsumer {
 
     DDLEvent event = sequencedEvent.getEvent();
     DDLOperation ddlOperation = event.getOperation();
-    String normalizedDatabaseName = datasetName == null ?
-      BigQueryUtils.normalizeDatasetName(event.getOperation().getDatabaseName()) :
-      BigQueryUtils.normalizeDatasetName(datasetName);
+    String normalizedDatabaseName = BigQueryUtils.getNormalizedDatasetName(datasetName,
+      event.getOperation().getDatabaseName());
     String normalizedTableName = BigQueryUtils.normalizeTableName(ddlOperation.getTableName());
     String normalizedStagingTableName = normalizedTableName == null ? null :
       BigQueryUtils.normalizeTableName(stagingTablePrefix + normalizedTableName);
 
-    runWithRetries(ctx -> handleDDL(event, normalizedDatabaseName, normalizedTableName, normalizedStagingTableName),
-                   baseRetryDelay,
-                   normalizedDatabaseName,
-                   event.getOperation().getSchemaName(),
-                   normalizedTableName,
-                   String.format("Failed to apply '%s' DDL event", event.getOperation()),
-                   String.format("Exhausted retries trying to apply '%s' DDL event", event.getOperation())
-                   );
+    RetryPolicy<Object> retryPolicy = createBaseRetryPolicy(baseRetryDelay)
+      .abortOn(ex -> ex instanceof DeltaFailureException)
+      .onFailedAttempt(failureContext -> {
+        handleBigQueryFailure(normalizedDatabaseName, event.getOperation().getSchemaName(), normalizedTableName,
+                              String.format("Failed to apply '%s' DDL event",  GSON.toJson(event)), failureContext);
+      });
 
+    runWithRetryPolicy(
+      ctx -> {
+        try {
+          handleDDL(event, normalizedDatabaseName, normalizedTableName, normalizedStagingTableName);
+        } catch (BigQueryException ex) {
+          //Unsupported DDL Operation
+          if (isInvalidOperationError(ex)) {
+            throw new DeltaFailureException("Non recoverable error in applying DDL event, aborting", ex);
+          }
+        }
+      },
+      String.format("Exhausted retries trying to apply '%s' DDL event",
+                    event.getOperation()), retryPolicy
+    );
 
     latestOffset = event.getOffset();
 
@@ -446,8 +473,8 @@ public class BigQueryEventConsumer implements EventConsumer {
         // TODO: flush changes, execute a copy job, delete previous table, drop old staging table, remove old entry
         //  in primaryKeyStore, put new entry in primaryKeyStore
         LOG.warn("Rename DDL events are not supported. Ignoring rename event in database {} from table {} to table {}.",
-          event.getOperation().getDatabaseName(), event.getOperation().getPrevTableName(),
-          event.getOperation().getTableName());
+                 event.getOperation().getDatabaseName(), event.getOperation().getPrevTableName(),
+                 event.getOperation().getTableName());
         break;
       case TRUNCATE_TABLE:
         flush();
@@ -501,14 +528,14 @@ public class BigQueryEventConsumer implements EventConsumer {
     }
     primaryKeyStore.put(tableId, primaryKeys);
     context.putState(getTableStateKey(tableId),
-            Bytes.toBytes(GSON.toJson(new BigQueryTableState(primaryKeys, getSortKeys(tableId)))));
+                     Bytes.toBytes(GSON.toJson(new BigQueryTableState(primaryKeys, getSortKeys(tableId)))));
   }
 
   private List<String> getPrimaryKeys(TableId targetTableId) throws IOException, DeltaFailureException {
     List<String> primaryKeys = primaryKeyStore.get(targetTableId);
     if (primaryKeys == null) {
       byte[] stateBytes = context.getState(getTableStateKey(targetTableId));
-      if (stateBytes == null) {
+      if (stateBytes == null || stateBytes.length == 0) {
         throw new DeltaFailureException(
           String.format("Primary key information for table '%s' in dataset '%s' could not be found. This can only " +
                           "happen if state was corrupted. Please create a new replicator and start again.",
@@ -516,6 +543,7 @@ public class BigQueryEventConsumer implements EventConsumer {
       }
       BigQueryTableState targetTableState = GSON.fromJson(new String(stateBytes), BigQueryTableState.class);
       primaryKeys = targetTableState.getPrimaryKeys();
+      primaryKeyStore.put(targetTableId, primaryKeys);
     }
     return primaryKeys;
   }
@@ -558,23 +586,21 @@ public class BigQueryEventConsumer implements EventConsumer {
       throw flushException;
     }
     DMLEvent event = sequencedEvent.getEvent();
-    String normalizedDatabaseName = datasetName == null ?
-      BigQueryUtils.normalizeDatasetName(event.getOperation().getDatabaseName()) :
-      BigQueryUtils.normalizeDatasetName(datasetName);
+    String normalizedDatabaseName = BigQueryUtils.getNormalizedDatasetName(datasetName,
+       event.getOperation().getDatabaseName());
     String normalizedTableName = BigQueryUtils.normalizeTableName(event.getOperation().getTableName());
     DMLEvent normalizedDMLEvent = BigQueryUtils.normalize(event)
       .setDatabaseName(normalizedDatabaseName)
       .setTableName(normalizedTableName)
       .build();
     long sequenceNumber = sequencedEvent.getSequenceNumber();
-    gcsWriter.write(new Sequenced<>(normalizedDMLEvent, sequenceNumber));
 
     TableId tableId = TableId.of(project, normalizedDatabaseName, normalizedTableName);
 
     Long latestMergedSequencedNum = latestMergedSequence.get(tableId);
     if (latestMergedSequencedNum == null) {
       // first event of the table
-      latestMergedSequencedNum  = getLatestSequenceNum(tableId);
+      latestMergedSequencedNum = getLatestSequenceNum(tableId);
       latestMergedSequence.put(tableId, latestMergedSequencedNum);
       // latestSeenSequence will replace the latestMergedSequence at the end of flush()
       // set this default value to avoid dup query of max merged sequence num in next `flush()`
@@ -586,6 +612,9 @@ public class BigQueryEventConsumer implements EventConsumer {
     // so it's possible we see an event that was already merged to target table
     if (sequenceNumber > latestMergedSequencedNum) {
       latestSeenSequence.put(tableId, sequenceNumber);
+      //Only write events which have not already been applied
+      Failsafe.with(gcsWriterRetryPolicy)
+              .run(() -> gcsWriter.write(new Sequenced<>(normalizedDMLEvent, sequenceNumber)));
     }
 
     latestOffset = event.getOffset();
@@ -672,7 +701,7 @@ public class BigQueryEventConsumer implements EventConsumer {
               blob.getDataset(), blob.getTable());
     TableId targetTableId = TableId.of(project, blob.getDataset(), blob.getTable());
     long retryDelay = Math.min(91, context.getMaxRetrySeconds()) - 1;
-    runWithRetries(runContext -> loadTable(targetTableId, blob, true, runContext.getAttemptCount()),
+    runWithRetries(runContext -> loadTable(targetTableId, blob, JobType.LOAD_TARGET, runContext.getAttemptCount()),
                    retryDelay,
                    blob.getDataset(),
                    blob.getSourceDbSchemaName(),
@@ -693,9 +722,10 @@ public class BigQueryEventConsumer implements EventConsumer {
 
   private void mergeTableChanges(TableBlob blob) throws DeltaFailureException, InterruptedException {
     String normalizedStagingTableName = BigQueryUtils.normalizeTableName(stagingTablePrefix + blob.getTable());
+
     TableId stagingTableId = TableId.of(project, blob.getDataset(), normalizedStagingTableName);
     long retryDelay = Math.min(91, context.getMaxRetrySeconds()) - 1;
-    runWithRetries(runContext -> loadTable(stagingTableId, blob, false, runContext.getAttemptCount()),
+    runWithRetries(runContext -> loadTable(stagingTableId, blob, JobType.LOAD_STAGING, runContext.getAttemptCount()),
                    retryDelay,
                    blob.getDataset(),
                    blob.getSourceDbSchemaName(),
@@ -729,60 +759,23 @@ public class BigQueryEventConsumer implements EventConsumer {
     }
   }
 
-  private void loadTable(TableId tableId, TableBlob blob, boolean directLoadToTarget, int attemptNumber)
+  private void loadTable(TableId tableId, TableBlob blob, JobType jobType, int attemptNumber)
     throws InterruptedException, IOException, DeltaFailureException {
-    LOG.info("Loading batch {} of {} events into {} table for {}.{}", blob.getBatchId(), blob.getNumEvents(),
-            directLoadToTarget ? "target" : "staging", blob.getDataset(), blob.getTable());
-    Table table = bigQuery.getTable(tableId);
-    if (table == null) {
-      List<String> primaryKeys = getPrimaryKeys(TableId.of(project, blob.getDataset(), blob.getTable()));
-      Clustering clustering = maxClusteringColumns <= 0 ? null : Clustering.newBuilder()
-        .setFields(primaryKeys.subList(0, Math.min(maxClusteringColumns, primaryKeys.size())))
-        .build();
-      TableDefinition tableDefinition = StandardTableDefinition.newBuilder()
-        .setLocation(bucket.getLocation())
-        .setSchema(Schemas.convert(blob.getStagingSchema()))
-        .setClustering(clustering)
-        .build();
-      TableInfo.Builder builder = TableInfo.newBuilder(tableId, tableDefinition);
-      if (encryptionConfig != null) {
-        builder.setEncryptionConfiguration(encryptionConfig);
-      }
-      TableInfo tableInfo = builder.build();
-      bigQuery.create(tableInfo);
-    }
-    // load data from GCS object into staging BQ table
-    // batch id is a timestamp generated at the time the first event was seen, so the job id is
-    // guaranteed to be different from the previous batch for the table
-    JobId jobId = JobId.newBuilder()
-      .setLocation(bucket.getLocation())
-      .setJob(String.format("%s_stage_%s_%s_%d_%d", context.getApplicationName(), blob.getDataset(),
-                            blob.getTable(), blob.getBatchId(), attemptNumber))
-      .build();
-    BlobId blobId = blob.getBlob().getBlobId();
-    String uri = String.format("gs://%s/%s", blobId.getBucket(), blobId.getName());
+    LOG.info("Loading batch {} of {} events into {} table for {}.{} {}", blob.getBatchId(), blob.getNumEvents(),
+             jobType.isForTargetTable() ? "target" : "staging", blob.getDataset(), blob.getTable(),
+             attemptNumber > 0 ? "attempt: " + attemptNumber : "");
 
-    // Explicitly set schema for load jobs 
-    com.google.cloud.bigquery.Schema bqSchema
-      = Schemas.convert(directLoadToTarget ? blob.getTargetSchema() : blob.getStagingSchema());
-    LoadJobConfiguration.Builder jobConfigBuilder = LoadJobConfiguration
-            .newBuilder(tableId, uri)
-            .setSchema(bqSchema)
-            .setSchemaUpdateOptions(ImmutableList.of(JobInfo.SchemaUpdateOption.ALLOW_FIELD_ADDITION));
-    if (encryptionConfig != null) {
-      jobConfigBuilder.setDestinationEncryptionConfiguration(encryptionConfig);
+    Job loadJob = null;
+    if (attemptNumber > 0) {
+      // Check if any job from previous attempts was successful to avoid loading the same data multiple times
+      // which can lead to data inconsistency
+      loadJob = getPreviousJobIfNotFailed(blob, attemptNumber, jobType);
     }
-    if (blob.isJsonFormat()) {
-      jobConfigBuilder.setFormatOptions(FormatOptions.json());
-    } else {
-      jobConfigBuilder.setFormatOptions(FormatOptions.avro());
-      jobConfigBuilder.setUseAvroLogicalTypes(true);
+
+    if (loadJob == null) {
+      loadJob = createLoadJob(tableId, blob, attemptNumber, jobType);
     }
-    LoadJobConfiguration loadJobConf = jobConfigBuilder.build();
-    JobInfo jobInfo = JobInfo.newBuilder(loadJobConf)
-      .setJobId(jobId)
-      .build();
-    Job loadJob = BigQueryUtils.createBigQueryJob(bigQuery, jobInfo);
+
     Job completedJob = loadJob.waitFor();
     if (completedJob == null) {
       // should not happen since we just submitted the job
@@ -798,11 +791,108 @@ public class BigQueryEventConsumer implements EventConsumer {
     }
   }
 
+  private Job getPreviousJobIfNotFailed(TableBlob blob, int attemptNumber, JobType jobType) {
+    Job previousJob = getJobFromPreviousAttemptsIfExists(blob, attemptNumber, jobType);
+    if (previousJob != null) {
+      if (isFailedJob(previousJob)) {
+        LOG.warn("Previous job {} failed with error {} attempting to run a new job", previousJob,
+                 previousJob.getStatus().getError());
+      } else {
+        return previousJob;
+      }
+    }
+    return null;
+  }
+
+  private Job createLoadJob(TableId tableId, TableBlob blob, int attemptNumber, JobType jobType)
+    throws IOException, DeltaFailureException {
+    Table table = bigQuery.getTable(tableId);
+    if (table == null) {
+      List<String> primaryKeys = getPrimaryKeys(TableId.of(project, blob.getDataset(), blob.getTable()));
+      Clustering clustering = maxClusteringColumns <= 0 ? null : Clustering.newBuilder()
+        .setFields(primaryKeys.subList(0, Math.min(maxClusteringColumns, primaryKeys.size())))
+        .build();
+
+      Schema schema = jobType.isForTargetTable() ? blob.getTargetSchema() : blob.getStagingSchema();
+      TableDefinition tableDefinition = StandardTableDefinition.newBuilder()
+        .setLocation(bucket.getLocation())
+        .setSchema(Schemas.convert(schema))
+        .setClustering(clustering)
+        .build();
+      TableInfo.Builder builder = TableInfo.newBuilder(tableId, tableDefinition);
+      if (encryptionConfig != null) {
+        builder.setEncryptionConfiguration(encryptionConfig);
+      }
+      TableInfo tableInfo = builder.build();
+      bigQuery.create(tableInfo);
+    }
+    // load data from GCS object into staging BQ table
+    // batch id is a timestamp generated at the time the first event was seen, so the job id is
+    // guaranteed to be different from the previous batch for the table
+    JobId jobId = JobId.newBuilder()
+      .setLocation(bucket.getLocation())
+      .setJob(getJobId(jobType, blob.getDataset(), blob.getTable(), blob.getBatchId(), attemptNumber))
+      .build();
+    BlobId blobId = blob.getBlob().getBlobId();
+    String uri = String.format("gs://%s/%s", blobId.getBucket(), blobId.getName());
+
+    // Explicitly set schema for load jobs
+    com.google.cloud.bigquery.Schema bqSchema
+      = Schemas.convert(jobType.isForTargetTable()  ? blob.getTargetSchema() : blob.getStagingSchema());
+    LoadJobConfiguration.Builder jobConfigBuilder = LoadJobConfiguration
+      .newBuilder(tableId, uri)
+      .setSchema(bqSchema)
+      .setSchemaUpdateOptions(ImmutableList.of(JobInfo.SchemaUpdateOption.ALLOW_FIELD_ADDITION));
+    if (encryptionConfig != null) {
+      jobConfigBuilder.setDestinationEncryptionConfiguration(encryptionConfig);
+    }
+    if (blob.isJsonFormat()) {
+      jobConfigBuilder.setFormatOptions(FormatOptions.json());
+    } else {
+      jobConfigBuilder.setFormatOptions(FormatOptions.avro());
+      jobConfigBuilder.setUseAvroLogicalTypes(true);
+    }
+    LoadJobConfiguration loadJobConf = jobConfigBuilder.build();
+    JobInfo jobInfo = JobInfo.newBuilder(loadJobConf)
+      .setJobId(jobId)
+      .build();
+    return BigQueryUtils.createBigQueryJob(bigQuery, jobInfo);
+  }
+
   private void mergeStagingTable(TableId stagingTableId, TableBlob blob,
                                  int attemptNumber) throws InterruptedException, IOException, DeltaFailureException {
 
-    LOG.info("Merging batch {} for {}.{}", blob.getBatchId(), blob.getDataset(), blob.getTable());
+    LOG.info("Merging batch {} for {}.{} {}", blob.getBatchId(), blob.getDataset(), blob.getTable(),
+             attemptNumber > 0 ? "attempt: " + attemptNumber : "");
 
+    Job mergeJob = null;
+    if (attemptNumber > 0) {
+      // Check if any job from previous attempts was successful to avoid merging the same data multiple times
+      // which can lead to data inconsistency
+      mergeJob = getPreviousJobIfNotFailed(blob, attemptNumber, JobType.MERGE_TARGET);
+    }
+
+    if (mergeJob == null) {
+      mergeJob = createMergeJob(stagingTableId, blob, attemptNumber);
+    }
+
+    Job completedJob = mergeJob.waitFor();
+    if (completedJob == null) {
+      // should not happen since we just submitted the job
+      throw new IOException("Merge query job no longer exists. Will be retried till retry timeout is reached.");
+    }
+    if (completedJob.getStatus().getError() != null) {
+      // merge job failed
+      throw new IOException(String.format("Failed to execute BigQuery merge query job: %s",
+                                          completedJob.getStatus().getError()));
+    }
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("Merged batch {} into {}.{}", blob.getBatchId(), blob.getDataset(), blob.getTable());
+    }
+  }
+
+  private Job createMergeJob(TableId stagingTableId, TableBlob blob, int attemptNumber)
+    throws IOException, DeltaFailureException {
     TableId targetTableId = TableId.of(project, blob.getDataset(), blob.getTable());
     List<String> primaryKeys = getPrimaryKeys(targetTableId);
     Optional<List<Schema.Type>> sortKeys = getCachedSortKeys(targetTableId);
@@ -994,13 +1084,13 @@ public class BigQueryEventConsumer implements EventConsumer {
 
     String diffQuery =
       createDiffQuery(stagingTableId, primaryKeys, blob.getBatchId(), latestMergedSequence.get(targetTableId),
-        sourceRowIdSupported, sourceEventOrdering, sortKeys);
+                      sourceRowIdSupported, sourceEventOrdering, sortKeys);
     if (LOG.isTraceEnabled()) {
       LOG.trace("Diff query : {}", diffQuery);
     }
     String mergeQuery =
       createMergeQuery(targetTableId, primaryKeys, blob.getTargetSchema(), diffQuery, sourceRowIdSupported,
-        sourceEventOrdering, softDeletesEnabled, sortKeys);
+                       sourceEventOrdering, softDeletesEnabled, sortKeys);
     if (LOG.isTraceEnabled()) {
       LOG.trace("Merge query : {}", mergeQuery);
     }
@@ -1018,26 +1108,12 @@ public class BigQueryEventConsumer implements EventConsumer {
     // event in the batch was seen
     JobId jobId = JobId.newBuilder()
       .setLocation(bucket.getLocation())
-      .setJob(String.format("%s_merge_%s_%s_%d_%d", context.getApplicationName(), blob.getDataset(), blob.getTable(),
-                            blob.getBatchId(), attemptNumber))
+      .setJob(getJobId(JobType.MERGE_TARGET, blob.getDataset(), blob.getTable(), blob.getBatchId(), attemptNumber))
       .build();
     JobInfo jobInfo = JobInfo.newBuilder(mergeJobConf)
       .setJobId(jobId)
       .build();
-    Job mergeJob = BigQueryUtils.createBigQueryJob(bigQuery, jobInfo);
-    Job completedJob = mergeJob.waitFor();
-    if (completedJob == null) {
-      // should not happen since we just submitted the job
-      throw new IOException("Merge query job no longer exists. Will be retried till retry timeout is reached.");
-    }
-    if (completedJob.getStatus().getError() != null) {
-      // merge job failed
-      throw new IOException(String.format("Failed to execute BigQuery merge query job: %s",
-                                          completedJob.getStatus().getError()));
-    }
-    if (LOG.isDebugEnabled()) {
-      LOG.debug("Merged batch {} into {}.{}", blob.getBatchId(), blob.getDataset(), blob.getTable());
-    }
+    return BigQueryUtils.createBigQueryJob(bigQuery, jobInfo);
   }
 
   static String createDiffQuery(TableId stagingTable, List<String> primaryKeys, long batchId,
@@ -1079,7 +1155,7 @@ public class BigQueryEventConsumer implements EventConsumer {
      *    This makes sure event in B happens later than event in A
      */
     if (sourceRowIdSupported) {
-      joinCondition =  "A._row_id = B._row_id ";
+      joinCondition = "A._row_id = B._row_id ";
       whereClause = " B._row_id IS NULL ";
     } else {
       joinCondition = primaryKeys.stream()
@@ -1217,10 +1293,10 @@ public class BigQueryEventConsumer implements EventConsumer {
     } else {
       // for unordered events
       deleteOperation = "  UPDATE SET " + targetSchema.getFields().stream()
-              .filter(predicate)
-              .map(Schema.Field::getName)
-              .map(name -> String.format("`%s` = D.`%s`", name, name))
-              .collect(Collectors.joining(", ")) + ", " + Constants.IS_DELETED + " = true ";
+        .filter(predicate)
+        .map(Schema.Field::getName)
+        .map(name -> String.format("`%s` = D.`%s`", name, name))
+        .collect(Collectors.joining(", ")) + ", " + Constants.IS_DELETED + " = true ";
       // if events are unordered , sort keys can decide the ordering
       // if an event happening earlier comes later , it's possible that some events happening later against the same
       // row has already been merged, so this late coming event should be ignored.
@@ -1247,7 +1323,7 @@ public class BigQueryEventConsumer implements EventConsumer {
         // explicitly set "_is_deleted" to null for the case when this row was previously deleted and the
         // "_is_deleted" column was set to "true" and now a new insert is to insert the same row , we need to
         // reset "_is_deleted" back to null.
-        .collect(Collectors.joining(", ")) +  ", " + Constants.IS_DELETED + " = null\n" +
+        .collect(Collectors.joining(", ")) + ", " + Constants.IS_DELETED + " = null\n" +
       "WHEN NOT MATCHED AND D._op IN (\"INSERT\", \"UPDATE\") THEN\n" +
       "  INSERT (" +
       targetSchema.getFields().stream()
@@ -1276,24 +1352,55 @@ public class BigQueryEventConsumer implements EventConsumer {
     return mergeQuery;
   }
 
-  private void runWithRetries(ContextualRunnable runnable, long retryDelay, String dataset, String schema, String table,
-    String onFailedAttemptMessage, String retriesExhaustedMessage) throws DeltaFailureException, InterruptedException {
-    RetryPolicy<Object> retryPolicy = createBaseRetryPolicy(retryDelay)
-      .onFailedAttempt(failureContext -> {
-        Throwable t = failureContext.getLastFailure();
-        LOG.error(onFailedAttemptMessage, t);
-        // its ok to set table state every retry, because this is a no-op if there is no change to the state.
-        try {
-          context.setTableError(dataset, table, new ReplicationError(t));
-        } catch (IOException e) {
-          // setting table state is not a fatal error, log a warning and continue on
-          LOG.warn("Unable to set error state for table {}.{}.{} Replication state for the table may be incorrect.",
-                   dataset, schema, table);
-        }
-      });
+  private boolean isFailedJob(Job previousJob) {
+    return previousJob.getStatus() != null && previousJob.getStatus().getState() == JobStatus.State.DONE
+      && previousJob.getStatus().getError() != null;
+  }
 
+  /**
+   * The method checks if any previous attempt for the job exists and returns the first job found
+   * while iterating from the provided (attemptNumber - 1) to 0
+   * Existence of the job is checked by creating deterministic job Id containing attempt number
+   *
+   * @param blob blob to create deterministic job Id
+   * @param attemptNumber attempt number below which to check previous jobs
+   * @param jobType job type to create deterministic job Id
+   * @return first job which exists while iterating from the provided
+   * (attemptNumber - 1) to 0, null if no job exists
+   */
+  private Job getJobFromPreviousAttemptsIfExists(TableBlob blob, int attemptNumber, JobType jobType) {
+    for (int prevAttemptNumber = attemptNumber - 1; prevAttemptNumber >= 0; prevAttemptNumber--) {
+      JobId jobId = JobId.newBuilder()
+        .setLocation(bucket.getLocation())
+        .setJob(getJobId(jobType, blob.getDataset(), blob.getTable(), blob.getBatchId(), prevAttemptNumber))
+        .build();
+
+      Job job = bigQuery.getJob(jobId);
+      if (job != null) {
+        return job;
+      }
+    }
+    return null;
+  }
+
+  private void runWithRetries(ContextualRunnable runnable, long retryDelay, String dataset, String schema, String table,
+                              String onFailedAttemptMessage, String retriesExhaustedMessage)
+    throws DeltaFailureException, InterruptedException {
+
+    runWithRetryPolicy(runnable, retriesExhaustedMessage, createBaseRetryPolicy(retryDelay)
+      //Do not retry in case of invalid requests errors, but let the retrey happen from Worker
+      //which can potentially mitigate the issue
+      .abortOn(this::isInvalidOperationError)
+      .onFailedAttempt(failureContext -> {
+        handleBigQueryFailure(dataset, schema, table, onFailedAttemptMessage, failureContext);
+      }));
+  }
+
+  private void runWithRetryPolicy(ContextualRunnable runnable, String retriesExhaustedMessage,
+                                  RetryPolicy<Object>... retryPolicies)
+    throws DeltaFailureException, InterruptedException {
     try {
-      Failsafe.with(retryPolicy).run(runnable);
+      Failsafe.with(retryPolicies).run(runnable);
     } catch (TimeoutExceededException e) {
       // if the retry timeout was reached, throw a DeltaFailureException to fail the pipeline immediately
       DeltaFailureException exc = new DeltaFailureException(retriesExhaustedMessage, e);
@@ -1310,30 +1417,55 @@ public class BigQueryEventConsumer implements EventConsumer {
     }
   }
 
+  private void handleBigQueryFailure(String dataset, String schema, String table, String onFailedAttemptMessage,
+                                     ExecutionAttemptedEvent<Object> failureContext) {
+    Throwable t = failureContext.getLastFailure();
+    LOG.error(onFailedAttemptMessage, t);
+    if (t.getCause() instanceof BigQueryException) {
+      t = t.getCause();
+    }
+    //Logging error list
+    if (t instanceof BigQueryException) {
+      List<BigQueryError> errors = ((BigQueryException) t).getErrors();
+      if (errors != null) {
+        errors.forEach(err -> LOG.error(err.getMessage()));
+      }
+    }
+    // its ok to set table state every retry, because this is a no-op if there is no change to the state.
+    try {
+      context.setTableError(dataset, table, new ReplicationError(t));
+    } catch (Exception e) {
+      // setting table state is not a fatal error, log a warning and continue on
+      LOG.warn(String.format("Unable to set error state for table %s.%s.%s " +
+                               "Replication state for the table may be incorrect.",
+                             dataset, schema, table), e);
+    }
+  }
+
   /**
    * Creates the ordering condition to ensure that event in B happens later than event in A
    * assuming aliasLeft = A and aliasRight = B
-   *
+   * <p>
    * Scenario 1 - Sort keys are present
-   *  For 3 sort keys, 'A' as leftAlias and 'B' as rightAlias
-   *  (A._sort._key_0 is NOT NULL AND B._sort._key_0 is NOT NULL AND
-   *  (A._sort._key_0 < B._sort._key_0) OR
-   *  (A._sort._key_0 = B._sort._key_0  AND A._sort._key_1 < B._sort._key_1) OR
-   *  (A._sort._key_0 = B._sort._key_0  AND  A._sort._key_1 = B._sort._key_1  AND A._sort._key_2 < B._sort._key_2))
-   *  OR $BACKWARD_COMPAT_CONDITION)
+   * For 3 sort keys, 'A' as leftAlias and 'B' as rightAlias
+   * (A._sort._key_0 is NOT NULL AND B._sort._key_0 is NOT NULL AND
+   * (A._sort._key_0 < B._sort._key_0) OR
+   * (A._sort._key_0 = B._sort._key_0  AND A._sort._key_1 < B._sort._key_1) OR
+   * (A._sort._key_0 = B._sort._key_0  AND  A._sort._key_1 = B._sort._key_1  AND A._sort._key_2 < B._sort._key_2))
+   * OR $BACKWARD_COMPAT_CONDITION)
+   * <p>
+   * where $BACKWARD_COMPAT_CONDITION takes care of the scenario where one or both rows do not have sort key
+   * It is used to ensure the ordering for older data which might not have sort keys in upgrade scenarios
+   * (A._sort._key_0 is NULL OR B._sort._key_0 is NULL) AND
+   * (A._source_timestamp < B._source_timestamp OR A._source_timestamp = B._source_timestamp AND
+   * A._sequence_num < B._sequence_num)
+   * <p>
+   * Scenario 2 - Sort keys are not present, use source timestamp for ordering
+   * (A._source_timestamp < B._source_timestamp OR A._source_timestamp = B._source_timestamp AND
+   * A._sequence_num < B._sequence_num)
    *
-   *  where $BACKWARD_COMPAT_CONDITION takes care of the scenario where one or both rows do not have sort key
-   *  It is used to ensure the ordering for older data which might not have sort keys in upgrade scenarios
-   *    (A._sort._key_0 is NULL OR B._sort._key_0 is NULL) AND
-   *    (A._source_timestamp < B._source_timestamp OR A._source_timestamp = B._source_timestamp AND
-   *    A._sequence_num < B._sequence_num)
-   *
-   *  Scenario 2 - Sort keys are not present, use source timestamp for ordering
-   *  (A._source_timestamp < B._source_timestamp OR A._source_timestamp = B._source_timestamp AND
-   *  A._sequence_num < B._sequence_num)
-   *
-   * @param sortKeys Optionals list of sort keys
-   * @param aliasLeft Alias of the left table to be used for comparison
+   * @param sortKeys   Optionals list of sort keys
+   * @param aliasLeft  Alias of the left table to be used for comparison
    * @param aliasRight Alias of the right table to be used for comparison
    * @return ordering condition
    */
@@ -1345,7 +1477,7 @@ public class BigQueryEventConsumer implements EventConsumer {
       String firstSortKey = Constants.SORT_KEYS + "." + Constants.SORT_KEY_FIELD + "_" + 0;
       // A._sort._key_0 is NOT NULL AND B._sort._key_0 is NOT NULL
       condition.append(
-              String.format(" AND (( %2$s.%1$s is NOT NULL AND %3$s.%1$s is NOT NULL AND (",
+        String.format(" AND (( %2$s.%1$s is NOT NULL AND %3$s.%1$s is NOT NULL AND (",
                       firstSortKey, aliasLeft, aliasRight));
 
       // Main condition for comparing sort keys
@@ -1368,19 +1500,19 @@ public class BigQueryEventConsumer implements EventConsumer {
       condition.append(" OR \n");
       // A._sort._key_0 is NULL AND B._sort._key_0 is NULL
       condition.append(
-              String.format("(( %1$s.%3$s is NULL OR %2$s.%3$s is NULL )", aliasLeft, aliasRight, firstSortKey));
+        String.format("(( %1$s.%3$s is NULL OR %2$s.%3$s is NULL )", aliasLeft, aliasRight, firstSortKey));
       // A._source_timestamp < B._source_timestamp OR A._source_timestamp = B._source_timestamp AND
       // A._sequence_num < B._sequence_num
       condition.append(
-              String.format(" AND ( %1$s.%3$s < %2$s.%3$s OR ( %1$s.%3$s = %2$s.%3$s AND %1$s.%4$s < %2$s.%4$s ))))",
+        String.format(" AND ( %1$s.%3$s < %2$s.%3$s OR ( %1$s.%3$s = %2$s.%3$s AND %1$s.%4$s < %2$s.%4$s ))))",
                       aliasLeft, aliasRight, Constants.SOURCE_TIMESTAMP, Constants.SEQUENCE_NUM));
     } else {
       // Sort keys not available in schema, fallback to source timestamp and sequence num
       // A._source_timestamp < B._source_timestamp OR A._source_timestamp = B._source_timestamp AND
       // A._sequence_num < B._sequence_num
       condition.append(String.format(" AND (%1$s.%3$s < %2$s.%3$s" +
-                      " OR (%1$s.%3$s = %2$s.%3$s AND %1$s.%4$s < %2$s.%4$s))",
-              aliasLeft, aliasRight, Constants.SOURCE_TIMESTAMP, Constants.SEQUENCE_NUM));
+                                       " OR (%1$s.%3$s = %2$s.%3$s AND %1$s.%4$s < %2$s.%4$s))",
+                                     aliasLeft, aliasRight, Constants.SOURCE_TIMESTAMP, Constants.SEQUENCE_NUM));
     }
     return condition.toString();
   }
@@ -1397,7 +1529,7 @@ public class BigQueryEventConsumer implements EventConsumer {
         long answer = BigQueryUtils.getMaximumSequenceNumberForTable(bigQuery, tableId, encryptionConfig);
         if (LOG.isDebugEnabled()) {
           LOG.debug("Loaded {} as the latest merged sequence number for {}.{}", answer, tableId.getDataset(),
-            tableId.getTable());
+                    tableId.getTable());
         }
         return answer;
       });
@@ -1433,10 +1565,10 @@ public class BigQueryEventConsumer implements EventConsumer {
   private void storeSortKeys(TableId tableId, List<SortKey> sortKeys) throws IOException, DeltaFailureException {
     if (sortKeys != null && !sortKeys.isEmpty()) {
       List<Schema.Type> sortKeyTypes = sortKeys.stream()
-              .map(SortKey::getType).collect(Collectors.toList());
+        .map(SortKey::getType).collect(Collectors.toList());
       sortKeyStore.put(tableId, new SortKeyState(sortKeyTypes));
       context.putState(getTableStateKey(tableId),
-              Bytes.toBytes(GSON.toJson(new BigQueryTableState(getPrimaryKeys(tableId), sortKeyTypes))));
+                       Bytes.toBytes(GSON.toJson(new BigQueryTableState(getPrimaryKeys(tableId), sortKeyTypes))));
     }
   }
 
@@ -1464,6 +1596,11 @@ public class BigQueryEventConsumer implements EventConsumer {
     return String.format("bigquery-%s-%s", tableId.getDataset(), tableId.getTable());
   }
 
+  private String getJobId(JobType jobType, String dataset, String table, long batchId, int attemptNumber) {
+    return String.format("%s_%s_%s_%s_%d_%d", context.getApplicationName(), jobType.getId(), dataset,
+                         table, batchId, attemptNumber);
+  }
+
   /**
    * Utility method that unwraps ExecutionExceptions and propagates their cause as-is when possible.
    * Expects to be given a Future for a call to mergeTableChanges.
@@ -1485,6 +1622,10 @@ public class BigQueryEventConsumer implements EventConsumer {
   }
 
   private <T> RetryPolicy<T> createBaseRetryPolicy(long baseDelay) {
+    return createBaseRetryPolicy(baseDelay, Integer.MAX_VALUE);
+  }
+
+  private <T> RetryPolicy<T> createBaseRetryPolicy(long baseDelay, int maxAttempts) {
     RetryPolicy<T> retryPolicy = new RetryPolicy<>();
     retryPolicy.abortOn(f -> shouldStop.get());
     if (context.getMaxRetrySeconds() < 1) {
@@ -1492,7 +1633,11 @@ public class BigQueryEventConsumer implements EventConsumer {
     }
 
     long maxDelay = Math.max(baseDelay + 1, loadIntervalSeconds);
-    return retryPolicy.withMaxAttempts(Integer.MAX_VALUE)
+    return retryPolicy.withMaxAttempts(maxAttempts)
       .withBackoff(baseDelay, maxDelay, ChronoUnit.SECONDS);
+  }
+
+  private boolean isInvalidOperationError(Throwable ex) {
+    return ex instanceof BigQueryException && BigQueryUtils.isInvalidOperationError((BigQueryException) ex);
   }
 }

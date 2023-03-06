@@ -17,6 +17,7 @@
 package io.cdap.delta.bigquery;
 
 import com.google.cloud.bigquery.BigQuery;
+import com.google.cloud.bigquery.BigQueryError;
 import com.google.cloud.bigquery.BigQueryException;
 import com.google.cloud.bigquery.EncryptionConfiguration;
 import com.google.cloud.bigquery.FieldValue;
@@ -28,6 +29,7 @@ import com.google.cloud.bigquery.QueryJobConfiguration;
 import com.google.cloud.bigquery.Table;
 import com.google.cloud.bigquery.TableId;
 import com.google.cloud.bigquery.TableResult;
+import com.google.common.base.Strings;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Sets;
 import io.cdap.cdap.api.data.format.StructuredRecord;
@@ -38,12 +40,12 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.regex.Pattern;
@@ -69,13 +71,16 @@ public final class BigQueryUtils {
           Pattern.compile("[^\\p{L}\\p{M}\\p{N}\\p{Pc}\\p{Pd}\\p{Zs}]+");
   private static final String BIG_QUERY_DUPLICATE_ERROR = "duplicate";
 
+  private static final Set<String> BQ_ABORT_REASONS = new HashSet<>(Arrays.asList("invalid", "invalidQuery"));
+  private static final int BQ_INVALID_REQUEST_CODE = 400;
+
   private BigQueryUtils() {
   }
 
   static long getMaximumExistingSequenceNumber(Set<SourceTable> allTables, String project,
                                                @Nullable String datasetName, BigQuery bigQuery,
                                                EncryptionConfiguration encryptionConfiguration,
-                                               int maxTablesPerQuery) {
+                                               int maxTablesPerQuery) throws InterruptedException {
 
     Set<SourceTable> allRemainingTables = allTables;
     long maxExisting = 0;
@@ -100,12 +105,11 @@ public final class BigQueryUtils {
    * missing '_sequence_num' column in any of the tables, exception will be thrown.
    */
   static long getMaximumExistingSequenceNumberPerBatch(Set<SourceTable> allTables, String project,
-                                                       @Nullable String datasetName, BigQuery bigQuery,
-                                                       EncryptionConfiguration encryptionConfiguration) {
+                        @Nullable String datasetName, BigQuery bigQuery,
+                        EncryptionConfiguration encryptionConfiguration) throws InterruptedException {
     SourceTable table0 = allTables.stream().findFirst().get();
     Set<TableId> existingTableIDs = new HashSet<>();
-    String dataset = datasetName != null ? normalizeDatasetName(datasetName) :
-      normalizeDatasetName(table0.getDatabase());
+    String dataset = getNormalizedDatasetName(datasetName, table0.getDatabase());
     if (bigQuery.getDataset(dataset) != null) {
       for (Table table : bigQuery.listTables(dataset).iterateAll()) {
         existingTableIDs.add(table.getTableId());
@@ -116,8 +120,8 @@ public final class BigQueryUtils {
     builder.append("SELECT MAX(max_sequence_num) FROM (");
     List<String> maxSequenceNumQueryPerTable = new ArrayList<>();
     for (SourceTable table : allTables) {
-      TableId tableId = TableId.of(project, datasetName != null ? normalizeDatasetName(datasetName) :
-        normalizeDatasetName(table.getDatabase()), normalizeTableName(table.getTable()));
+      TableId tableId = TableId.of(project, getNormalizedDatasetName(datasetName, table.getDatabase()),
+                                   normalizeTableName(table.getTable()));
       if (existingTableIDs.contains(tableId)) {
         maxSequenceNumQueryPerTable.add(String.format("SELECT MAX(_sequence_num) as max_sequence_num FROM %s",
                                                       wrapInBackTick(tableId.getDataset(), tableId.getTable())));
@@ -127,16 +131,9 @@ public final class BigQueryUtils {
     builder.append(String.join(" UNION ALL ", maxSequenceNumQueryPerTable));
     builder.append(");");
 
-    long maxSequenceNumber;
-    try {
-      maxSequenceNumber = maxSequenceNumQueryPerTable.size() == 0 ? 0 : executeAggregateQuery(bigQuery,
-                                                                                              builder.toString(),
-                                                                                              encryptionConfiguration);
-    } catch (Exception e) {
-      throw new RuntimeException("Failed to compute the maximum sequence number among all the target tables " +
-                                   "selected for replication. Please make sure that if target tables exists, " +
-                                   "they should have '_sequence_num' column in them.", e);
-    }
+    long maxSequenceNumber = maxSequenceNumQueryPerTable.size() == 0 ? 0 : executeAggregateQuery(bigQuery,
+            builder.toString(),
+            encryptionConfiguration);;
     return maxSequenceNumber;
   }
 
@@ -177,6 +174,21 @@ public final class BigQueryUtils {
     }
 
     return val.getLongValue();
+  }
+
+  /**
+   * Get normalized dataset name for target dataset
+   * Method returns normalized datasetName if it is not empty
+   * Otherwise it returns normalized form of databaseName
+   * @param datasetName dataset name to be normalized
+   * @param databaseName database name to be used if datasetName is empty
+   * @return normalized datasetName if it is not empty otherwise normalized form of databaseName
+   */
+  public static String getNormalizedDatasetName(@Nullable String datasetName, String databaseName) {
+    if (Strings.isNullOrEmpty(datasetName)) {
+      return normalizeDatasetName(databaseName);
+    }
+    return normalizeDatasetName(datasetName);
   }
 
   /**
@@ -293,5 +305,21 @@ public final class BigQueryUtils {
       }
       throw e;
     }
+  }
+
+  /**
+   * Checks if BigQuery exception is due to invalid request
+   *
+   * @param ex {@link BigQueryException}
+   * @return true if BigQuery exception is due to invalid request
+   */
+  public static boolean isInvalidOperationError(BigQueryException ex) {
+    if (ex.getCode() == BQ_INVALID_REQUEST_CODE && ex.getError() != null) {
+      BigQueryError error = ex.getError();
+      if (BQ_ABORT_REASONS.contains(error.getReason())) {
+        return true;
+      }
+    }
+    return false;
   }
 }
