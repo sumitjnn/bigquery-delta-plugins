@@ -20,10 +20,18 @@ on:
       - Trigger build
     types:
       - completed
+  workflow_dispatch:
+    # workaround to run manual trigger for a particular branch
+    inputs:
+      run_its:
+        description: "Run ITs"
+        required: true
+        type: boolean
+        default: true 
 
 jobs:
   build:
-    runs-on: k8s-runner-build
+    runs-on: ubuntu-latest
 
     if: ${{ github.event.workflow_run.conclusion != 'skipped' }}
 
@@ -43,6 +51,16 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-maven-${{ github.workflow }}
 
+      - name: Run ITs
+        if: ${{ run_its }}
+        run: |
+          echo "Running ITs"
+          
+      - name: Skip ITs
+        if: ${{ !run_its }}
+        run: |
+          echo "Skipping ITs"          
+          
       - name: Build with Maven
         run: mvn clean compile test -fae -T 2 -B -V -DcloudBuild -Dmaven.wagon.http.retryHandler.count=3 -Dmaven.wagon.httpconnectionManager.ttlSeconds=25
 
