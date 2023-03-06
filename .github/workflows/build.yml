@@ -52,12 +52,12 @@ jobs:
             ${{ runner.os }}-maven-${{ github.workflow }}
 
       - name: Run ITs
-        if: ${{ run_its }}
+        if: ${{ github.event.inputs.run_its }}
         run: |
           echo "Running ITs"
           
       - name: Skip ITs
-        if: ${{ !run_its }}
+        if: ${{ !github.event.inputs.run_its }}
         run: |
           echo "Skipping ITs"          
           
